@@ -1,0 +1,33 @@
+BATC Pauser
+Copyright (C) 2026 jshef747
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See the LICENSE file for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+
+Third-party components
+----------------------
+
+Python-SimConnect (the "SimConnect" PyPI package) by Anthony Pray
+  https://github.com/odwdinc/Python-SimConnect
+  Licensed under the GNU AGPL-3.0. BATC Pauser imports this library, and any
+  bundled copy of it (including SimConnect.dll) is redistributed under the same
+  AGPL-3.0 license. This is why BATC Pauser as a whole is AGPL-3.0.
+
+
+Not affiliated
+--------------
+
+BATC Pauser is an independent utility. It is not affiliated with, endorsed by,
+or bundling any files or assets from BeyondATC (Skirmish Mode Games), SimBrief
+(Navigraph), or Microsoft Flight Simulator (Microsoft / Asobo). It interoperates
+with BeyondATC only by reading its local Player.log (read-only) and by
+suspending and resuming its process while the sim is paused, and with Microsoft
+Flight Simulator through SimConnect. All product names are the property of their
+respective owners.

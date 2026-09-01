@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 jshef747
+# BATC Pauser is free software under the GNU AGPL-3.0; see LICENSE and NOTICE.
 """BATC Pauser - pause Microsoft Flight Simulator 2024 at a waypoint of your
 choosing, or when BeyondATC clears you for the arrival or issues a descent.
 

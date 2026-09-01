@@ -11,3 +11,9 @@ config.json
 # Design canvas: ignore the large generated payload, keep the .dc.html sources
 design/*.html
 !design/*.dc.html
+
+# Build / release artifacts (exe, zip, PyInstaller output)
+release/
+build/
+dist/
+*.spec

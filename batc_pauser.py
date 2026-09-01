@@ -50,7 +50,11 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 APP_NAME = "BATC Pauser"
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # PyInstaller: keep config.json beside the .exe, not in the temp unpack dir.
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 
 

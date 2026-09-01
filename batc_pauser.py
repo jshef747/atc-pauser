@@ -138,9 +138,9 @@ def load_config() -> dict:
     return cfg
 
 
-def save_simbrief_id(value: str) -> None:
-    """Persist just the SimBrief id back to config.json, leaving every other
-    key the user has set untouched."""
+def save_config(**updates) -> None:
+    """Persist the given keys back to config.json, leaving every other key the
+    user has set untouched."""
     data: dict = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_PATH.exists():
         try:
@@ -149,11 +149,11 @@ def save_simbrief_id(value: str) -> None:
                 data.update(loaded)
         except (OSError, ValueError):
             pass
-    data["simbrief_id"] = value
+    data.update(updates)
     try:
         CONFIG_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
-        print(f"{APP_NAME}: could not save simbrief_id ({exc})", file=sys.stderr)
+        print(f"{APP_NAME}: could not save config ({exc})", file=sys.stderr)
 
 
 def default_player_log() -> Path:
@@ -912,9 +912,11 @@ class App:
         self.speed_target = 1.0
         self.speed_btns: dict[float, tk.Button] = {}
 
-        # Optional: freeze BeyondATC's process alongside the sim.
-        self.batc = (BatcController(str(cfg.get("beyondatc_process") or "BeyondATC.exe"))
-                     if cfg.get("pause_beyondatc") else None)
+        # Freeze BeyondATC's process alongside the sim.  The controller is always
+        # built (it does nothing until asked); pause_batc, bound to a checkbox,
+        # decides whether pausing also suspends it.
+        self.batc = BatcController(str(cfg.get("beyondatc_process") or "BeyondATC.exe"))
+        self.pause_batc = bool(cfg.get("pause_beyondatc", True))
 
         self.root = tk.Tk()
         dpi = self.root.winfo_fpixels("1i")
@@ -1017,8 +1019,18 @@ class App:
 
         self._build_speed_row(outer)
 
+        # Toggle: pause BeyondATC too, or just the sim.
+        toggle = tk.Frame(outer, bg=BG)
+        toggle.pack(fill="x", pady=(self.px(10), 0))
+        self.batc_var = tk.BooleanVar(value=self.pause_batc)
+        tk.Checkbutton(toggle, text="Also freeze BeyondATC when paused",
+                       variable=self.batc_var, command=self.on_toggle_batc,
+                       font=self.font_small, bg=BG, fg=MUTED, activebackground=BG,
+                       activeforeground=INK, selectcolor=CARD_BG, anchor="w",
+                       bd=0, highlightthickness=0, padx=0, pady=0).pack(side="left")
+
         buttons = tk.Frame(outer, bg=BG)
-        buttons.pack(fill="x", pady=(self.px(12), 0))
+        buttons.pack(fill="x", pady=(self.px(10), 0))
         # One button that mirrors the sim: it only ever says "Resume sim" when
         # the sim is actually paused, so it can never imply a pause that is not
         # there.  It doubles as the old Test button when the sim is running.
@@ -1140,19 +1152,25 @@ class App:
     def quit(self) -> None:
         self.watcher.stop()
         self.sim.stop()
-        if self.batc is not None:       # never leave BeyondATC frozen on exit
-            self.batc.resume()
+        self.batc.resume()              # never leave BeyondATC frozen on exit
         self.root.destroy()
 
     def _pause(self) -> None:
         self.sim.pause()
-        if self.batc is not None:
+        if self.pause_batc:
             self.batc.suspend()
 
     def _resume(self) -> None:
         self.sim.resume()
-        if self.batc is not None:
-            self.batc.resume()
+        self.batc.resume()              # harmless if it was never suspended
+
+    def on_toggle_batc(self) -> None:
+        self.pause_batc = self.batc_var.get()
+        save_config(pause_beyondatc=self.pause_batc)
+        if self.pause_batc and self.status.sim_paused:
+            self.batc.suspend()         # enabled mid-pause: freeze it now
+        elif not self.pause_batc:
+            self.batc.resume()          # disabled: thaw it right away
 
     def _tick(self) -> None:
         while True:
@@ -1261,7 +1279,7 @@ class App:
         # Remember it so it is typed once, ever - both in this session and on disk.
         if ident != str(self.cfg.get("simbrief_id") or ""):
             self.cfg["simbrief_id"] = ident
-            save_simbrief_id(ident)
+            save_config(simbrief_id=ident)
         self.loading_plan = True
         self.btn_load.configure(text="…", state="disabled")
         self.plan_status.configure(text="loading plan from SimBrief…")

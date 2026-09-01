@@ -50,6 +50,7 @@ from pathlib import Path
 from tkinter import font as tkfont
 
 APP_NAME = "BATC Pauser"
+APP_VERSION = "1.0"
 if getattr(sys, "frozen", False):
     # PyInstaller: keep config.json beside the .exe, not in the temp unpack dir.
     APP_DIR = Path(sys.executable).resolve().parent
@@ -867,6 +868,10 @@ SPEEDS = (1.0, 2.0, 4.0)
 # Dropdown entry that means "no waypoint - use the STAR / descent trigger".
 NO_WP_LABEL = "— arrival / descent —"
 
+# Window/taskbar icon: an amber airliner on an ink rounded square, embedded as a
+# base64 PNG so the app stays a single file with no external asset to ship.
+ICON_PNG_B64 = "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"
+
 
 def enable_dpi_awareness() -> None:
     """Must run before the first Tk window, or text renders bitmap-scaled."""
@@ -945,6 +950,13 @@ class App:
             root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self.quit)
 
+        # Window / taskbar icon (kept on self so Tk does not garbage-collect it).
+        try:
+            self._icon = tk.PhotoImage(data=ICON_PNG_B64)
+            root.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
         # Dark title band, flush to the window edge under the OS chrome.
         header = tk.Frame(root, bg=HEADER_BG)
         header.pack(fill="x")
@@ -953,7 +965,7 @@ class App:
         tk.Frame(hin, bg=AMBER, width=self.px(8), height=self.px(8)).pack(side="left")
         tk.Label(hin, text="BATC PAUSER", bg=HEADER_BG, fg=HEADER_FG,
                  font=self.font_head).pack(side="left", padx=(self.px(9), 0))
-        tk.Label(hin, text="v1.2", bg=HEADER_BG, fg=FAINT,
+        tk.Label(hin, text=f"v{APP_VERSION}", bg=HEADER_BG, fg=FAINT,
                  font=self.font_small).pack(side="right")
 
         outer = tk.Frame(root, bg=BG, padx=self.px(14), pady=self.px(14))

@@ -1,0 +1,6 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html", "title": "BATC Pauser", "x": 0, "y": 0, "w": 448, "h": 700 }
+  ],
+  "launch": { "view": "focused", "file": "Main.dc.html" }
+}

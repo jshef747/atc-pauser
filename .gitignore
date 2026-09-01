@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# User config: auto-generated on first run and holds your personal SimBrief ID
+config.json
+
+# Lavish review artifacts
+.lavish/
+
+# Design canvas: ignore the large generated payload, keep the .dc.html sources
+design/*.html
+!design/*.dc.html

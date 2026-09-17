@@ -1,12 +1,13 @@
-# BATC Pauser
+# ATC Pauser
 
 Pauses Microsoft Flight Simulator 2024 at a point you choose - either a **waypoint from
-your SimBrief plan**, or the moment **BeyondATC** clears you for the arrival or issues a
-descent. Walk away in cruise, come back to a sim frozen where you wanted it.
+your SimBrief plan**, or the moment your ATC add-on (**BeyondATC** or **SayIntentions.AI**)
+clears you for the arrival or issues a descent. Walk away in cruise, come back to a sim
+frozen where you wanted it.
 
 ## Running it
 
-Double-click **`Start BATC Pauser.bat`**. Nothing to install: it uses the Python and
+Double-click **`Start ATC Pauser.bat`**. Nothing to install: it uses the Python and
 `SimConnect` package already on this machine.
 
 Order does not matter - start it before or after MSFS and BeyondATC, in any combination.
@@ -17,7 +18,7 @@ It reconnects on its own and survives either one restarting.
 | Row | Meaning |
 |---|---|
 | **MSFS 2024** | green once SimConnect is connected *and proven* - the events it needs are mapped |
-| **BeyondATC** | green while `Player.log` is actively being written; `idle for 53m` means BeyondATC is closed |
+| **BeyondATC** / **SayIntent.** | the active provider (from Settings). BeyondATC: green while `Player.log` is being written (`idle for 53m` means it is closed). SayIntentions: `listening` once the API key works and a flight is active |
 | **Pause at** | pick a waypoint from your loaded SimBrief plan, or leave it on `— arrival / descent —` to arm on the ATC clearance instead. **Load** fetches your latest plan |
 | **Banner** | bold state - `ARMED`, `PAUSED`, `TRIGGERED`, or `DISARMED` - over a line spelling out exactly what will happen (`will pause 5 nm before HELEN`, or `will pause on a STAR or descent clearance`) |
 | **Last trigger** | which arm fired (`WP HELEN`, `STAR`, `DESCENT`, `CPDLC`), local time, and the clearance text or distance |
@@ -27,6 +28,11 @@ It reconnects on its own and survives either one restarting.
   while the sim is running (press it to freeze the sim now - handy to confirm the MSFS
   link) and flips to `Resume sim` only while the sim is actually paused.
 - **Disarm** for when you are back at the desk and do not want surprise pauses.
+- The **⚙ gear** (top-right) opens **Settings**, where the *freeze BeyondATC* toggle and
+  *Telegram phone alerts* live - kept off the main panel so it stays compact. It also has
+  an optional **Global pause hotkey**: click its field and press a shortcut such as
+  `Ctrl+Alt+P`. It works while MSFS has focus and toggles Pause / Resume just like the
+  main button. It is off until you assign it. Use **Clear** to remove it.
 
 The pause is a **complete freeze**. MSFS 2024 has no SimConnect pause that stops the world
 clock (both `PAUSE_ON` and `PAUSE_SET` only give an *active* pause - the aircraft freezes
@@ -34,6 +40,21 @@ but time of day keeps advancing, confirmed against the sim and Asobo's own dev n
 the app freezes the aircraft **and** holds the clock still, re-setting the Zulu time once a
 second while paused (`ZULU_HOURS_SET` / `ZULU_MINUTES_SET`). Set `hold_clock` to `false` to
 let time run during a pause.
+
+## Choosing your ATC provider
+
+Open **Settings** (the ⚙ gear) and pick **BeyondATC** or **SayIntentions** at the top. The
+choice is remembered.
+
+- **BeyondATC** (the default) needs nothing extra - it reads BeyondATC's local `Player.log`.
+- **SayIntentions.AI** has no local transcript; its ATC communications live in the cloud, so
+  ATC Pauser reads them through SayIntentions' own API. Paste your **API key** (from the
+  SayIntentions pilot portal - a subscription is required) into the **API KEY** field and
+  press **TEST** to confirm it works. The key is stored locally in `config.json` and is only
+  ever sent to SayIntentions.
+
+The **SimBrief waypoint arm below works with either provider** (it uses only your flight plan
+and the aircraft's position), so you can use it even without an ATC add-on running.
 
 ## Pausing at a waypoint
 
@@ -47,14 +68,41 @@ Selecting a waypoint does **not** switch off the ATC arm - both run at once, and
 whichever fires first pauses the sim. So a descent clearance that comes before your
 waypoint still catches you.
 
-## Freezing BeyondATC too
+## Freezing the ATC add-on too
 
-With `pause_beyondatc` on (the default), a pause also **suspends the BeyondATC process** -
-it stops talking and holds its state, then picks up exactly where it left off on resume.
-BeyondATC has no API, so this is done by freezing its threads at the OS level (fully
-reversible; the app also thaws it on exit). Set `beyondatc_process` if your executable is
-named differently. Caveats: pausing mid-transmission cuts the audio abruptly, and a very
-long freeze may make BeyondATC's backend connection reconnect on resume.
+With **Also freeze the ATC app when paused** on in **Settings** (⚙, the default), a pause
+also **suspends the active ATC add-on's process** - it stops talking and holds its state,
+then picks up where it left off on resume. Neither add-on exposes a control API, so this is
+done by freezing its threads at the OS level (fully reversible; the app also thaws it on
+exit). Set `beyondatc_process` / `sayintentions_process` if your executable is named
+differently. Caveats: pausing mid-transmission cuts the audio abruptly. And because
+**SayIntentions is cloud-based**, suspending its local client mutes it during the pause but
+the server-side AI may move on, so it resumes less seamlessly than BeyondATC - if that
+bothers you, turn this toggle off under SayIntentions and just freeze the sim.
+
+## Getting a phone alert (Telegram)
+
+Optional: have the app **message your phone the moment it pauses**, so you know to come
+back. It uses a Telegram bot - free, needs nothing beyond Telegram itself, and it only
+ever messages **you**.
+
+One-time setup, about two minutes:
+
+1. In Telegram, open a chat with **@BotFather**, send `/newbot`, and follow the prompts
+   (any name). BotFather replies with a **bot token** like `1234567890:AAE…` - copy it.
+2. Open a chat with **@userinfobot** and send it anything. It replies with your numeric
+   **chat ID**, e.g. `987654321` - copy it.
+3. **Send your new bot any message** (e.g. `hi`). Telegram forbids a bot from messaging
+   someone who has never written to it first, so skipping this makes the test fail with
+   *"chat not found"*. This is the step people forget.
+4. In ATC Pauser, click the **⚙ gear**, paste the token and chat ID into **Bot token**
+   and **Chat ID**, and press **Send test**. A message should arrive on your phone. The
+   fields save on their own.
+
+From then on you get a **⏸ paused** message (with the trigger and Zulu time) when the app
+pauses, and a **▶ resumed** message when you unpause. Clear either field to switch alerts
+off. The token and chat ID can also be set directly in `config.json`, and the two messages
+toggled with `notify_on_pause` / `notify_on_resume`.
 
 ## Re-arming after a pause
 
@@ -106,10 +154,17 @@ Here direction does matter, so the watcher learns your callsign from the
 `CPDLC_Relay: Inbound` line (always your own downlink) and only fires on `To=<you>`.
 That is why your own `REQUEST DESCEND` does not trip it.
 
+**SayIntentions.AI** works differently: it keeps no local transcript (its local files are
+sim telemetry). The ATC conversation lives in the cloud, so ATC Pauser polls SayIntentions'
+`getCommsHistory` endpoint every few seconds with your API key, asking only for messages
+newer than the last one it saw - the cloud equivalent of tailing a log. It matches what ATC
+said (each entry's `outgoing_message`) against `si_trigger_patterns`, and because
+SayIntentions only ever talks to you, no callsign filtering is needed. On first sight of a
+flight it baselines to the current end, so the history already on the server never fires.
+
 Pausing itself is SimConnect `PAUSE_ON` (an active pause), with the Zulu clock held still
-each second so time of day does not drift (see **The window** above). BeyondATC keeps
-talking while the sim is frozen, because it runs outside the sim - so you still hear the
-clearance.
+each second so time of day does not drift (see **The window** above). The ATC add-on keeps
+talking while the sim is frozen (it runs outside the sim), so you still hear the clearance.
 
 ## Configuration
 
@@ -117,7 +172,8 @@ clearance.
 
 | Key | Default | Notes |
 |---|---|---|
-| `player_log` | `"auto"` | `auto` resolves the path above; or give an explicit path |
+| `provider` | `"beyondatc"` | which ATC add-on to listen to: `"beyondatc"` or `"sayintentions"`; usually set from **Settings** |
+| `player_log` | `"auto"` | (BeyondATC) `auto` resolves the path above; or give an explicit path |
 | `simconnect_dll` | `"auto"` | point at an MSFS 2024 SDK `SimConnect.dll` if the bundled one ever fails |
 | `simbrief_id` | `""` | your SimBrief Pilot ID (numeric) or username; usually set from the **SimBrief** box in the window rather than here |
 | `waypoint_arm_nm` | `5.0` | how many nm before the chosen waypoint to pause |
@@ -130,8 +186,17 @@ clearance.
 | `instruction_timeout_s` | `10` | fire anyway if the clearance text never arrives |
 | `log_idle_seconds` | `180` | older than this and BeyondATC is reported idle |
 | `rearm_seconds` | `30` | grace hold before arming again - only used by `timer` mode (`resume` mode re-arms instantly) |
-| `pause_beyondatc` | `true` | suspend the BeyondATC process while paused so it freezes too |
-| `beyondatc_process` | `"BeyondATC.exe"` | the process name to suspend |
+| `pause_beyondatc` | `true` | suspend the active ATC add-on's process while paused so it freezes too (toggled in **Settings**; key name kept for back-compat) |
+| `beyondatc_process` | `"BeyondATC.exe"` | process to suspend when the provider is BeyondATC |
+| `sayintentions_api_key` | `""` | (SayIntentions) your pilot-portal API key; usually set from **Settings**. Blank = no clearance detection |
+| `sayintentions_process` | `"SayIntentions.exe"` | process to suspend when the provider is SayIntentions |
+| `si_trigger_patterns` | 4 patterns | (SayIntentions) case-insensitive regexes matched against what ATC said, to arm on arrival/descent |
+| `si_poll_interval_s` | `3.0` | (SayIntentions) how often the cloud API is polled |
+| `pause_hotkey` | `""` | optional Windows-wide Pause / Resume shortcut, e.g. `"CTRL+ALT+P"`; blank disables it |
+| `telegram_bot_token` | `""` | Telegram bot token from @BotFather; usually set from **Settings**. Blank = alerts off |
+| `telegram_chat_id` | `""` | your numeric chat ID from @userinfobot |
+| `notify_on_pause` | `true` | send a Telegram message when the sim pauses |
+| `notify_on_resume` | `true` | send a Telegram message when you resume |
 | `start_armed` | `true` | |
 | `always_on_top` | `true` | |
 
@@ -159,9 +224,9 @@ Confirmed by test against BeyondATC 1.10.0 and the real `Player.log`:
 
 **Still to confirm with the sim running** - the two things no offline test can settle:
 
-1. Click **Test** with MSFS 2024 in a flight. The sim must visibly pause, and
-   **Resume sim** must unpause it. This proves the bundled MSFS-2020-era
-   `SimConnect.dll` talks to MSFS 2024. If it does not, set `simconnect_dll`.
+1. Press **Pause sim** with MSFS 2024 in a flight. The sim must visibly pause, and
+   **Resume sim** must unpause it. This proves the bundled `SimConnect.dll` talks to
+   MSFS 2024. If it does not, set `simconnect_dll`.
 2. On a real CPDLC leg, capture the actual `Message queued` uplinks and tighten
    `cpdlc_uplink_content_patterns` to the wording BeyondATC really sends. The defaults
    are deliberately broad; because direction is filtered first, a broad pattern can only

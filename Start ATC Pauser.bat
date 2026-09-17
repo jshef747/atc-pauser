@@ -1,5 +1,5 @@
 @echo off
-rem Launches BATC Pauser with pythonw.exe so no console window appears.
+rem Launches ATC Pauser with pythonw.exe so no console window appears.
 setlocal
 set "PYW="
 for %%I in (pythonw.exe) do set "PYW=%%~$PATH:I"
@@ -10,4 +10,4 @@ if not defined PYW (
   pause
   exit /b 1
 )
-start "" "%PYW%" "%~dp0batc_pauser.py"
+start "" "%PYW%" "%~dp0atc_pauser.py"

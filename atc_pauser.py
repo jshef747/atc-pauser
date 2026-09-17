@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 jshef747
-# BATC Pauser is free software under the GNU AGPL-3.0; see LICENSE and NOTICE.
-"""BATC Pauser - pause Microsoft Flight Simulator 2024 at a waypoint of your
-choosing, or when BeyondATC clears you for the arrival or issues a descent.
+# ATC Pauser is free software under the GNU AGPL-3.0; see LICENSE and NOTICE.
+"""ATC Pauser - pause Microsoft Flight Simulator 2024 at a waypoint of your
+choosing, or when your ATC add-on clears you for the arrival or issues a descent.
 
 Two ways to arm:
 
   * Pick a waypoint from your SimBrief flight plan and the sim pauses a few
-    miles before you reach it.
-  * Pick nothing and it falls back to BeyondATC: it clears you for the STAR or
-    issues a descent, and the sim pauses the moment that clearance shows up.
+    miles before you reach it.  This works whichever ATC add-on you fly with.
+  * Pick nothing and it falls back to the ATC add-on: the moment it clears you
+    for the STAR or issues a descent, the sim pauses.
 
-BeyondATC has no public API, but it is a Unity app that writes a running
-transcript of every ATC transmission to Player.log.  Calls addressed to the
-player land as a [ControllerScript] + [Instruction] pair; when datalink is in
-use they arrive instead as a [CPDLC] uplink.  This watches for both and sends
-SimConnect PAUSE_ON the moment an arrival or descent clearance shows up.  The
-waypoint arm reads the aircraft's own position over SimConnect instead.
+Two ATC providers are supported, chosen by the `provider` config key / the
+Settings selector:
+
+  * BeyondATC has no public API, but it is a Unity app that writes a running
+    transcript of every ATC transmission to Player.log (a [ControllerScript] +
+    [Instruction] pair, or a [CPDLC] uplink on datalink).  LogWatcher tails it.
+  * SayIntentions.AI keeps no local transcript; its transcript lives in the
+    cloud and is read with the user's API key via the getCommsHistory endpoint.
+    SayIntentionsWatcher polls it.
+
+Both watchers emit Trigger events onto one queue, so the pause path is identical:
+the sim is frozen with SimConnect PAUSE_ON.  The waypoint arm reads the
+aircraft's own position over SimConnect and is provider-independent.
 
 Sections below, in order:
     1. Configuration
-    2. LogWatcher      - tails Player.log and emits Trigger events
+    2.  LogWatcher            - tails BeyondATC's Player.log and emits Trigger events
+    2b. SayIntentionsWatcher  - polls SayIntentions' cloud API and emits Trigger events
     3. SimBrief        - fetches a flight plan and its waypoints
     4. SimLink         - keeps a SimConnect connection alive, pauses, reads position
-    5. BatcController  - suspends/resumes the BeyondATC process
-    6. UI              - a small always-on-top tkinter window
+    5. AtcProcessController - suspends/resumes the active ATC add-on's process
+    6. Notifier        - optional Telegram push alerts on pause / resume
+    7. GlobalHotkey    - listens for an optional system-wide pause shortcut
+    8. UI              - a small always-on-top tkinter window
 """
 
 from __future__ import annotations
@@ -41,6 +51,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.error
 import urllib.parse
 import urllib.request
 from ctypes import wintypes
@@ -49,8 +60,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import font as tkfont
 
-APP_NAME = "BATC Pauser"
-APP_VERSION = "1.0"
+APP_NAME = "ATC Pauser"
+APP_VERSION = "1.1"
 if getattr(sys, "frozen", False):
     # PyInstaller: keep config.json beside the .exe, not in the temp unpack dir.
     APP_DIR = Path(sys.executable).resolve().parent
@@ -105,10 +116,44 @@ DEFAULT_CONFIG = {
     "rearm_mode": "resume",
     "rearm_seconds": 30,        # only used by "timer" mode
 
-    # Freeze BeyondATC too while paused, by suspending its process - it stops
-    # talking and holds its state, then picks up where it left off on resume.
+    # ATC provider the clearance trigger listens to:
+    #   "beyondatc"     - tail BeyondATC's local Player.log
+    #   "sayintentions" - poll SayIntentions.AI's cloud getCommsHistory API
+    #                     (needs your API key from the SayIntentions pilot portal)
+    # The SimBrief waypoint arm below works the same with either provider.
+    "provider": "beyondatc",
+    "sayintentions_api_key": "",
+    "sayintentions_process": "SayIntentions.exe",
+    # Matched case-insensitively against what ATC said, to arm on arrival/descent.
+    # Deliberately broad; tighten once you have seen SayIntentions' real wording.
+    "si_trigger_patterns": [
+        r"\bDESCEND\b",
+        r"\bDESCENT\b",
+        r"\bEXPECT\b.*\b(APPROACH|ARRIVAL|STAR)\b",
+        r"\bCLEARED\b.*\b(APPROACH|ARRIVAL|ILS|RNAV|VISUAL)\b",
+    ],
+    "si_poll_interval_s": 3.0,
+
+    # Also freeze the ATC add-on while paused, by suspending its process - it
+    # stops talking and holds its state, then resumes where it left off.  The
+    # process suspended is the active provider's (beyondatc_process, or
+    # sayintentions_process for SayIntentions).  Key name kept for back-compat.
     "pause_beyondatc": True,
     "beyondatc_process": "BeyondATC.exe",
+
+    # An optional Windows-wide shortcut which toggles MSFS pause even while its
+    # window has focus.  Leave blank to disable it.  Set it in Settings by
+    # clicking the field and pressing a combination, e.g. Ctrl+Alt+P.
+    "pause_hotkey": "",
+
+    # Optional Telegram push alerts, so a pause reaches your phone while you are
+    # away from the PC.  Create a bot with @BotFather for the token, get your
+    # numeric chat ID from @userinfobot, and paste both into the app (or here).
+    # Left blank, notifications are simply off.
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "notify_on_pause": True,
+    "notify_on_resume": True,
 
     "poll_interval_ms": 250,
     "instruction_timeout_s": 10.0,
@@ -178,7 +223,7 @@ class Status:
         self.sim_paused = False
         self.sim_detail = "waiting for MSFS"
         self.log_ok = False
-        self.log_detail = "waiting for BeyondATC"
+        self.log_detail = "starting…"      # provider watcher overwrites this quickly
         self.callsign = ""
         # Aircraft position, None until SimConnect reports it.
         self.plane_lat: float | None = None
@@ -363,6 +408,160 @@ class LogWatcher(threading.Thread):
 
     def _emit(self, label: str, text: str) -> None:
         self.out.put(Trigger(label, text, time.time()))
+
+
+# ---------------------------------------------------------------------------
+# 2b. SayIntentionsWatcher
+# ---------------------------------------------------------------------------
+
+SI_COMMS_URL = "https://apipri.sayintentions.ai/sapi/getCommsHistory"
+
+
+def si_label(text: str) -> str:
+    """Short display tag for a SayIntentions ATC line, mirroring the BeyondATC
+    STAR / DESCENT tags."""
+    upper = text.upper()
+    if "DESCEND" in upper or "DESCENT" in upper:
+        return "DESCENT"
+    if any(w in upper for w in ("APPROACH", "ARRIVAL", "STAR", "ILS", "RNAV", "VISUAL")):
+        return "STAR"
+    return "ATC"
+
+
+class SayIntentionsWatcher(threading.Thread):
+    """Polls SayIntentions.AI's cloud getCommsHistory API and puts Trigger
+    objects on the same queue LogWatcher uses, so everything downstream is
+    unchanged.
+
+    SayIntentions keeps no local ATC transcript (its local files are sim
+    telemetry); the transcript lives in the cloud and is read with the user's
+    API key.  Each poll asks only for entries newer than the last id seen, so
+    this tails the flight the way LogWatcher tails Player.log - and, like it, it
+    baselines to the current end on first sight (and whenever a new flight
+    starts) so the server-side backlog can never fire a pause.  Every network /
+    JSON error is swallowed and reported in the status line; the thread never
+    dies, and the key only ever goes to SayIntentions' own API."""
+
+    RETRY_SECONDS = 10.0        # back off to this after an error
+
+    def __init__(self, cfg: dict, status: Status, out: "queue.Queue[Trigger]") -> None:
+        super().__init__(name="SayIntentionsWatcher", daemon=True)
+        self.cfg = cfg
+        self.status = status
+        self.out = out
+        self._stop = threading.Event()
+        self._patterns = [re.compile(p, re.IGNORECASE) for p in cfg["si_trigger_patterns"]]
+        self._api_key = str(cfg.get("sayintentions_api_key") or "").strip()
+        self._interval = max(1.0, float(cfg.get("si_poll_interval_s", 3.0)))
+        self._since_id: int | None = None   # None until baselined to the flight's end
+        self._flight_id = None              # a change means a new flight -> re-baseline
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def update_key(self, key: str) -> None:
+        """Adopt a new API key mid-run and re-baseline on the next poll."""
+        self._api_key = (key or "").strip()
+        self._since_id = None
+        self._flight_id = None
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            if not self._api_key:
+                self.status.log_ok = False
+                self.status.log_detail = "no API key"
+                self._stop.wait(self._interval)
+                continue
+            wait = self._interval
+            try:
+                self._poll()
+            except Exception as exc:        # never let the polling thread die
+                self._note_error(exc)
+                wait = self.RETRY_SECONDS
+            self._stop.wait(wait)
+
+    def _poll(self) -> None:
+        params = {"api_key": self._api_key}
+        if self._since_id is not None:
+            params["since_id"] = self._since_id
+        url = SI_COMMS_URL + "?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+
+        entries = data.get("comm_history")
+        flight = data.get("flight_id")
+        if not isinstance(entries, list) or not flight:
+            # Key is valid, but no active flight session to read yet.
+            self.status.log_ok = False
+            self.status.log_detail = "waiting for a SayIntentions flight"
+            self._since_id = None
+            self._flight_id = None
+            return
+
+        # First sight of a flight (or a new flight) baselines to the current end
+        # so history already on the server can never fire.
+        if flight != self._flight_id or self._since_id is None:
+            self._flight_id = flight
+            self._since_id = self._max_id(entries, 0)
+            self.status.log_ok = True
+            self.status.log_detail = "listening"
+            return
+
+        self.status.log_ok = True
+        self.status.log_detail = "listening"
+        # Fire on new ATC messages, oldest first, then advance the cursor.
+        for entry in sorted(entries, key=self._entry_id):
+            eid = self._entry_id(entry)
+            if eid <= self._since_id:
+                continue
+            self._since_id = eid
+            atc = str(entry.get("outgoing_message_english")
+                      or entry.get("outgoing_message") or "").strip()
+            if atc and any(p.search(atc) for p in self._patterns):
+                self._emit(si_label(atc), atc)
+
+    @staticmethod
+    def _entry_id(entry) -> int:
+        try:
+            return int(entry.get("id"))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    def _max_id(self, entries, floor: int) -> int:
+        return max([floor] + [self._entry_id(e) for e in entries])
+
+    def _note_error(self, exc: Exception) -> None:
+        self.status.log_ok = False
+        if isinstance(exc, urllib.error.HTTPError):
+            self.status.log_detail = ("auth failed - check API key"
+                                      if exc.code in (401, 403) else f"HTTP {exc.code}")
+        elif isinstance(exc, (urllib.error.URLError, OSError)):
+            self.status.log_detail = "no connection"
+        else:
+            self.status.log_detail = "bad response"
+
+    def _emit(self, label: str, text: str) -> None:
+        self.out.put(Trigger(label, text, time.time()))
+
+
+def si_check_key(key: str) -> tuple[bool, str]:
+    """One-shot validation of a SayIntentions API key for the Test button."""
+    url = SI_COMMS_URL + "?" + urllib.parse.urlencode({"api_key": key.strip()})
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return False, ("key rejected - check it" if exc.code in (401, 403)
+                       else f"HTTP {exc.code}")
+    except (urllib.error.URLError, OSError) as exc:
+        return False, f"no connection ({getattr(exc, 'reason', exc)})"
+    except ValueError:
+        return False, "bad response"
+    if isinstance(data, dict) and data.get("error"):
+        return False, str(data.get("error"))[:60]
+    if isinstance(data, dict) and data.get("flight_id"):
+        return True, "key works - flight active"
+    return True, "key accepted - start a flight to arm"
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +942,7 @@ class _ProcessEntry32(ctypes.Structure):
     ]
 
 
-class BatcController:
+class AtcProcessController:
     """Suspends and resumes the BeyondATC process so it freezes with the sim.
 
     BeyondATC has no API, so the only reliable way to make it stop talking and
@@ -833,7 +1032,225 @@ class BatcController:
 
 
 # ---------------------------------------------------------------------------
-# 6. UI
+# 6. Notifier
+# ---------------------------------------------------------------------------
+
+class Notifier:
+    """Sends a Telegram message when the sim pauses or resumes.
+
+    Telegram's Bot API is a single HTTPS call, so this needs nothing beyond the
+    stdlib.  Every alert goes out on a throwaway daemon thread with a short
+    timeout and swallows all errors - a slow network or a bad token must never
+    delay or break the pause itself.  Blank token/chat means simply disabled."""
+
+    API = "https://api.telegram.org/bot{token}/sendMessage"
+
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.token = (token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+    def update(self, token: str, chat_id: str) -> None:
+        self.token = (token or "").strip()
+        self.chat_id = (chat_id or "").strip()
+
+    def notify(self, text: str) -> None:
+        """Fire-and-forget alert: never blocks the caller, never raises."""
+        if not self.configured:
+            return
+        threading.Thread(target=self._send, args=(text,),
+                         name="Notify", daemon=True).start()
+
+    def send_sync(self, text: str) -> tuple[bool, str]:
+        """Blocking send for the Test button - returns (ok, short_message)."""
+        if not self.configured:
+            return False, "enter a bot token and chat ID first"
+        return self._send(text)
+
+    def _send(self, text: str) -> tuple[bool, str]:
+        url = self.API.format(token=self.token)
+        payload = urllib.parse.urlencode({
+            "chat_id": self.chat_id,
+            "text": text,
+        }).encode()
+        try:
+            with urllib.request.urlopen(url, data=payload, timeout=10) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            # Telegram still returns a JSON "description" on a 4xx (bad token,
+            # wrong chat ID, bot never started); surface it - it is the fix.
+            return False, self._http_detail(exc)
+        except (urllib.error.URLError, OSError) as exc:
+            return False, f"no connection ({getattr(exc, 'reason', exc)})"
+        except ValueError as exc:
+            return False, f"bad response ({exc})"
+        if body.get("ok"):
+            return True, "sent"
+        return False, str(body.get("description") or "rejected by Telegram")
+
+    @staticmethod
+    def _http_detail(exc: "urllib.error.HTTPError") -> str:
+        try:
+            body = json.loads(exc.read().decode("utf-8", "replace"))
+            return str(body.get("description") or f"HTTP {exc.code}")
+        except (ValueError, OSError):
+            return f"HTTP {exc.code}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Global pause hotkey
+# ---------------------------------------------------------------------------
+
+_HOTKEY_MODIFIERS = {
+    "ALT": 0x0001,
+    "CTRL": 0x0002,
+    "SHIFT": 0x0004,
+    "WIN": 0x0008,
+}
+_HOTKEY_MODIFIER_NAMES = {
+    "CONTROL": "CTRL",
+    "CTRL": "CTRL",
+    "ALT": "ALT",
+    "SHIFT": "SHIFT",
+    "WINDOWS": "WIN",
+    "WIN": "WIN",
+}
+_HOTKEY_KEYS = {
+    "BACKSPACE": 0x08,
+    "TAB": 0x09,
+    "ENTER": 0x0D,
+    "ESC": 0x1B,
+    "SPACE": 0x20,
+    "PAGEUP": 0x21,
+    "PAGEDOWN": 0x22,
+    "END": 0x23,
+    "HOME": 0x24,
+    "LEFT": 0x25,
+    "UP": 0x26,
+    "RIGHT": 0x27,
+    "DOWN": 0x28,
+    "INSERT": 0x2D,
+    "DELETE": 0x2E,
+    "PAUSE": 0x13,
+}
+
+
+def parse_hotkey(value: str) -> tuple[str, int, int]:
+    """Return a canonical display string plus RegisterHotKey flags and key.
+
+    A normal letter or number must have a modifier: registering a bare letter
+    would steal ordinary typing from every program.  Function keys and Pause
+    are useful standalone exceptions for a cockpit button mapping.
+    """
+    parts = [part.strip().upper() for part in value.split("+") if part.strip()]
+    if not parts:
+        raise ValueError("empty")
+    key_name = parts.pop()
+    modifiers: list[str] = []
+    for part in parts:
+        name = _HOTKEY_MODIFIER_NAMES.get(part)
+        if name is None or name in modifiers:
+            raise ValueError("use Ctrl, Alt, Shift, Win, and one key")
+        modifiers.append(name)
+
+    is_function_key = bool(re.fullmatch(r"F(?:[1-9]|1[0-9]|2[0-4])", key_name))
+    if len(key_name) == 1 and key_name.isalnum():
+        key = ord(key_name)
+    elif is_function_key:
+        key = 0x70 + int(key_name[1:]) - 1
+    else:
+        key = _HOTKEY_KEYS.get(key_name)
+        if key is None:
+            raise ValueError("use a letter, number, F1–F24, or a named key")
+    if not modifiers and key_name != "PAUSE" and not is_function_key:
+        raise ValueError("add Ctrl, Alt, Shift, or Win")
+    flags = 0
+    for name in modifiers:
+        flags |= _HOTKEY_MODIFIERS[name]
+    return "+".join([*modifiers, key_name]), flags, key
+
+
+class GlobalHotkey(threading.Thread):
+    """Receives a RegisterHotKey message on its own Windows message queue.
+
+    Tk owns the UI thread's message loop, so keeping the registration in this
+    tiny daemon thread makes the shortcut work with MSFS in front and leaves
+    all Tk work on the UI thread via ``events``.
+    """
+
+    HOTKEY_ID = 0x4250
+    WM_HOTKEY = 0x0312
+    PM_REMOVE = 0x0001
+    MOD_NOREPEAT = 0x4000
+
+    def __init__(self, value: str) -> None:
+        super().__init__(name="GlobalHotkey", daemon=True)
+        self.events: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._requests: "queue.Queue[str]" = queue.Queue()
+        self._stop = threading.Event()
+        self._value = value
+
+    def configure(self, value: str) -> None:
+        self._requests.put(value)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        user32 = ctypes.windll.user32
+        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
+                                          wintypes.UINT, wintypes.UINT]
+        user32.RegisterHotKey.restype = wintypes.BOOL
+        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.UnregisterHotKey.restype = wintypes.BOOL
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                        wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.PeekMessageW.restype = wintypes.BOOL
+
+        registered = False
+        active_value: str | None = None
+        try:
+            while not self._stop.is_set():
+                requested = self._value
+                while True:
+                    try:
+                        requested = self._requests.get_nowait()
+                    except queue.Empty:
+                        break
+                self._value = requested
+                if requested != active_value:
+                    if registered:
+                        user32.UnregisterHotKey(None, self.HOTKEY_ID)
+                        registered = False
+                    active_value = requested
+                    if not requested:
+                        self.events.put(("disabled", "global pause hotkey is off"))
+                    else:
+                        try:
+                            display, flags, key = parse_hotkey(requested)
+                            registered = bool(user32.RegisterHotKey(
+                                None, self.HOTKEY_ID, flags | self.MOD_NOREPEAT, key))
+                            if registered:
+                                self.events.put(("ready", f"global: {display}"))
+                            else:
+                                self.events.put(("error", "could not register - already in use?"))
+                        except ValueError as exc:
+                            self.events.put(("error", str(exc)))
+                msg = wintypes.MSG()
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, self.PM_REMOVE):
+                    if msg.message == self.WM_HOTKEY and msg.wParam == self.HOTKEY_ID:
+                        self.events.put(("pressed", ""))
+                self._stop.wait(0.05)
+        finally:
+            if registered:
+                user32.UnregisterHotKey(None, self.HOTKEY_ID)
+
+
+# ---------------------------------------------------------------------------
+# 8. UI
 # ---------------------------------------------------------------------------
 
 # Instrument-mono palette: warm off-white paper, ink lines, amber + green.
@@ -886,13 +1303,37 @@ def enable_dpi_awareness() -> None:
         pass
 
 
+def is_sayintentions(cfg: dict) -> bool:
+    return str(cfg.get("provider", "beyondatc")).lower() == "sayintentions"
+
+
+def make_watcher(cfg: dict, status: Status, out: "queue.Queue[Trigger]"):
+    """Build the clearance watcher for the configured provider.  Both emit
+    Trigger objects onto `out`, so nothing downstream cares which one it is."""
+    if is_sayintentions(cfg):
+        return SayIntentionsWatcher(cfg, status, out)
+    return LogWatcher(cfg, status, out)
+
+
+def active_atc_process(cfg: dict) -> str:
+    """Name of the process to suspend for the active provider."""
+    if is_sayintentions(cfg):
+        return str(cfg.get("sayintentions_process") or "SayIntentions.exe")
+    return str(cfg.get("beyondatc_process") or "BeyondATC.exe")
+
+
+def provider_row_label(cfg: dict) -> str:
+    return "SAYINTENT." if is_sayintentions(cfg) else "BEYONDATC"
+
+
 class App:
     def __init__(self, cfg: dict) -> None:
         self.cfg = cfg
         self.status = Status()
         self.events: "queue.Queue[Trigger]" = queue.Queue()
         self.plan_results: "queue.Queue[tuple]" = queue.Queue()
-        self.watcher = LogWatcher(cfg, self.status, self.events)
+        self.provider = str(cfg.get("provider", "beyondatc")).lower()
+        self.watcher = make_watcher(cfg, self.status, self.events)
         self.sim = SimLink(cfg, self.status)
 
         self.armed = bool(cfg["start_armed"])
@@ -912,11 +1353,35 @@ class App:
         self.speed_target = 1.0
         self.speed_btns: dict[float, tk.Button] = {}
 
-        # Freeze BeyondATC's process alongside the sim.  The controller is always
-        # built (it does nothing until asked); pause_batc, bound to a checkbox,
-        # decides whether pausing also suspends it.
-        self.batc = BatcController(str(cfg.get("beyondatc_process") or "BeyondATC.exe"))
-        self.pause_batc = bool(cfg.get("pause_beyondatc", True))
+        # Freeze the active ATC add-on's process alongside the sim.  The controller
+        # is always built (it does nothing until asked); pause_atc, bound to a
+        # checkbox, decides whether pausing also suspends it.
+        self.atc = AtcProcessController(active_atc_process(cfg))
+        self.pause_atc = bool(cfg.get("pause_beyondatc", True))
+
+        # A global hotkey is optional and deliberately separate from the Arm
+        # state: it is an explicit manual pause, just like the Pause Sim button.
+        raw_hotkey = str(cfg.get("pause_hotkey") or "").strip()
+        self.hotkey_config_error = ""
+        if raw_hotkey:
+            try:
+                self.pause_hotkey, _, _ = parse_hotkey(raw_hotkey)
+            except ValueError as exc:
+                self.pause_hotkey = ""
+                self.hotkey_config_error = f"invalid saved hotkey: {exc}"
+        else:
+            self.pause_hotkey = ""
+        self.hotkey = GlobalHotkey(self.pause_hotkey)
+
+        # Optional Telegram push alerts.  The notifier no-ops until a token and
+        # chat ID are set; _was_paused / _pause_notified drive the resume alert
+        # off the paused->running edge so it only fires after a pause we announced.
+        self.notifier = Notifier(str(cfg.get("telegram_bot_token") or ""),
+                                 str(cfg.get("telegram_chat_id") or ""))
+        self.telegram_results: "queue.Queue[tuple[bool, str]]" = queue.Queue()
+        self.si_results: "queue.Queue[tuple[bool, str]]" = queue.Queue()
+        self._was_paused = False
+        self._pause_notified = False
 
         self.root = tk.Tk()
         dpi = self.root.winfo_fpixels("1i")
@@ -951,6 +1416,7 @@ class App:
         if self.cfg["always_on_top"]:
             root.attributes("-topmost", True)
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        self._settings_open = False
 
         # Window / taskbar icon (kept on self so Tk does not garbage-collect it).
         try:
@@ -965,29 +1431,47 @@ class App:
         hin = tk.Frame(header, bg=HEADER_BG, padx=self.px(13), pady=self.px(8))
         hin.pack(fill="x")
         tk.Frame(hin, bg=AMBER, width=self.px(8), height=self.px(8)).pack(side="left")
-        tk.Label(hin, text="BATC PAUSER", bg=HEADER_BG, fg=HEADER_FG,
+        tk.Label(hin, text="ATC PAUSER", bg=HEADER_BG, fg=HEADER_FG,
                  font=self.font_head).pack(side="left", padx=(self.px(9), 0))
         tk.Label(hin, text=f"v{APP_VERSION}", bg=HEADER_BG, fg=FAINT,
                  font=self.font_small).pack(side="right")
+        # Gear opens the settings page; it becomes a close mark while there.
+        self.btn_settings = tk.Label(hin, text="⚙", bg=HEADER_BG, fg=HEADER_FG,
+                                     font=self.font_head, cursor="hand2")
+        self.btn_settings.pack(side="right", padx=(0, self.px(12)))
+        self.btn_settings.bind("<Button-1>",
+                               lambda _e: self._show_page(not self._settings_open))
 
         outer = tk.Frame(root, bg=BG, padx=self.px(14), pady=self.px(14))
         outer.pack(fill="both", expand=True)
 
-        # Pins the content width so the window does not jitter as text changes.
+        # Pins the content width so the window does not jitter as text changes,
+        # and so the main and settings pages line up at one width.
         tk.Frame(outer, bg=BG, height=1, width=self.px(352)).pack(fill="x")
 
+        # Two pages share the outer area: the compact operating panel, and a
+        # settings page reached by the header gear.  Only one is packed at a
+        # time, so configuration never makes the main window taller.
+        self.main_page = tk.Frame(outer, bg=BG)
+        self.main_page.pack(fill="both", expand=True)
+        self.settings_page = tk.Frame(outer, bg=BG)
+        main = self.main_page
+
         # Status readout: two rows boxed by a hairline, split by a divider.
-        box = tk.Frame(outer, bg=LINE, highlightthickness=1, highlightbackground=LINE)
+        box = tk.Frame(main, bg=LINE, highlightthickness=1, highlightbackground=LINE)
         box.pack(fill="x")
         self.row_sim = self._status_row(box, "MSFS 2024")
         tk.Frame(box, bg=LINE, height=1).pack(fill="x")
-        self.row_log = self._status_row(box, "BEYONDATC")
+        # The second row tracks the active ATC provider; its label changes when
+        # you switch provider in Settings.
+        self.row_log = self._status_row(box, provider_row_label(self.cfg))
+        self.row_log_name = self.row_log[2]
 
-        self._build_plan_row(outer)
+        self._build_plan_row(main)
 
         # Banner: a bold state word with a marker, over a line spelling out
         # exactly what Armed will do.  Boxed with an ink hairline.
-        self.banner = tk.Frame(outer, bg=ARMED_BG, highlightthickness=1,
+        self.banner = tk.Frame(main, bg=ARMED_BG, highlightthickness=1,
                                highlightbackground=INK)
         self.banner.pack(fill="x", pady=(self.px(12), self.px(12)))
         self.banner_top = tk.Frame(self.banner, bg=ARMED_BG)
@@ -1002,7 +1486,7 @@ class App:
                                    font=self.font_sub, anchor="w")
         self.banner_sub.pack(fill="x", padx=self.px(13), pady=(self.px(3), self.px(11)))
 
-        head = tk.Frame(outer, bg=BG)
+        head = tk.Frame(main, bg=BG)
         head.pack(fill="x", pady=(0, self.px(4)))
         self.trigger_label = tk.Label(head, text="LAST TRIGGER", bg=BG, fg=MUTED,
                                       font=self.font_small)
@@ -1011,25 +1495,15 @@ class App:
                                      font=self.font_small)
         self.trigger_time.pack(side="right")
 
-        self.quote = tk.Label(outer, text="nothing yet", bg=CARD_BG, fg="#35322c",
+        self.quote = tk.Label(main, text="nothing yet", bg=CARD_BG, fg="#35322c",
                               font=self.font_mono, justify="left", anchor="w",
                               wraplength=self.px(326), padx=self.px(10), pady=self.px(8),
                               highlightthickness=1, highlightbackground=LINE)
         self.quote.pack(fill="x")
 
-        self._build_speed_row(outer)
+        self._build_speed_row(main)
 
-        # Toggle: pause BeyondATC too, or just the sim.
-        toggle = tk.Frame(outer, bg=BG)
-        toggle.pack(fill="x", pady=(self.px(10), 0))
-        self.batc_var = tk.BooleanVar(value=self.pause_batc)
-        tk.Checkbutton(toggle, text="Also freeze BeyondATC when paused",
-                       variable=self.batc_var, command=self.on_toggle_batc,
-                       font=self.font_small, bg=BG, fg=MUTED, activebackground=BG,
-                       activeforeground=INK, selectcolor=CARD_BG, anchor="w",
-                       bd=0, highlightthickness=0, padx=0, pady=0).pack(side="left")
-
-        buttons = tk.Frame(outer, bg=BG)
+        buttons = tk.Frame(main, bg=BG)
         buttons.pack(fill="x", pady=(self.px(10), 0))
         # One button that mirrors the sim: it only ever says "Resume sim" when
         # the sim is actually paused, so it can never imply a pause that is not
@@ -1038,6 +1512,7 @@ class App:
                                       last=False, primary=True)
         self.btn_arm = self._button(buttons, "DISARM", self.on_toggle_arm, last=True)
 
+        self._build_settings_page()
         self._refresh()
 
     def _status_row(self, parent, name: str):
@@ -1047,11 +1522,12 @@ class App:
         inner.pack(fill="x")
         mark = tk.Frame(inner, bg=GREY, width=self.px(7), height=self.px(7))
         mark.pack(side="left", pady=self.px(3))
-        tk.Label(inner, text=name, bg=BG, fg=MUTED, font=self.font_body,
-                 width=11, anchor="w").pack(side="left", padx=(self.px(9), 0))
+        name_lbl = tk.Label(inner, text=name, bg=BG, fg=MUTED, font=self.font_body,
+                            width=11, anchor="w")
+        name_lbl.pack(side="left", padx=(self.px(9), 0))
         value = tk.Label(inner, text="", bg=BG, fg=INK, font=self.font_body, anchor="w")
         value.pack(side="left", fill="x", expand=True)
-        return mark, value
+        return mark, value, name_lbl
 
     def _build_plan_row(self, parent) -> None:
         # SimBrief identity: type your Pilot ID or username here and press Load.
@@ -1114,6 +1590,172 @@ class App:
                      padx=(0, 1 if i < len(SPEEDS) - 1 else 0))
             self.speed_btns[rate] = btn
 
+    def _build_settings_page(self) -> None:
+        """The settings page keeps one-time setup off the operating panel."""
+        page = self.settings_page
+
+        bar = tk.Frame(page, bg=BG)
+        bar.pack(fill="x")
+        back = tk.Label(bar, text="‹ BACK", bg=BG, fg=MUTED, font=self.font_small,
+                        cursor="hand2")
+        back.pack(side="left")
+        back.bind("<Button-1>", lambda _e: self._show_page(False))
+        tk.Label(bar, text="SETTINGS", bg=BG, fg=FAINT,
+                 font=self.font_small).pack(side="right")
+        tk.Frame(page, bg=LINE, height=1).pack(fill="x", pady=(self.px(9), self.px(11)))
+
+        # ATC provider: which add-on's clearances arm the pause.  The SayIntentions
+        # API-key field lives inside pbox so it can be shown/hidden in place.
+        pbox = tk.Frame(page, bg=BG)
+        pbox.pack(fill="x")
+        tk.Label(pbox, text="ATC PROVIDER", bg=BG, fg=MUTED, font=self.font_small,
+                 anchor="w").pack(fill="x")
+        seg = tk.Frame(pbox, bg=INK, highlightthickness=1, highlightbackground=INK)
+        seg.pack(fill="x", pady=(self.px(7), 0))
+        self.provider_btns: dict[str, tk.Button] = {}
+        _opts = [("beyondatc", "BeyondATC"), ("sayintentions", "SayIntentions")]
+        for i, (key, label) in enumerate(_opts):
+            btn = tk.Button(seg, text=label, font=self.font_small, bg=CARD_BG, fg=MUTED,
+                            activebackground="#efece6", relief="flat", borderwidth=0,
+                            highlightthickness=0, pady=self.px(5),
+                            command=lambda k=key: self.on_provider_change(k))
+            btn.pack(side="left", fill="x", expand=True,
+                     padx=(0, 1 if i < len(_opts) - 1 else 0))
+            self.provider_btns[key] = btn
+
+        self.si_key_frame = tk.Frame(pbox, bg=BG)
+        krow = tk.Frame(self.si_key_frame, bg=BG)
+        krow.pack(fill="x", pady=(self.px(8), 0))
+        tk.Label(krow, text="API KEY", bg=BG, fg=FAINT, font=self.font_small,
+                 width=9, anchor="w").pack(side="left")
+        self.si_key_var = tk.StringVar(value=str(self.cfg.get("sayintentions_api_key") or ""))
+        e_key = tk.Entry(krow, textvariable=self.si_key_var, font=self.font_body,
+                         bg=CARD_BG, fg=INK, relief="solid", borderwidth=1,
+                         highlightthickness=0, insertbackground=INK)
+        e_key.pack(side="left", fill="x", expand=True, padx=(self.px(6), 0), ipady=self.px(3))
+        e_key.bind("<FocusOut>", lambda _e: self._save_si_key())
+        e_key.bind("<Return>", lambda _e: self._save_si_key())
+        srow = tk.Frame(self.si_key_frame, bg=BG)
+        srow.pack(fill="x", pady=(self.px(7), 0))
+        self.si_status = tk.Label(srow, text="", bg=BG, fg=FAINT, font=self.font_small,
+                                  anchor="w", wraplength=self.px(200), justify="left")
+        self.si_status.pack(side="left", fill="x", expand=True)
+        self.btn_si_test = tk.Button(srow, text="TEST", command=self.on_test_si,
+                                     font=self.font_small, bg=BTN_BG, fg=INK,
+                                     activebackground="#e6e3dd", relief="solid", borderwidth=1,
+                                     highlightthickness=0, padx=self.px(10), pady=self.px(3))
+        self.btn_si_test.pack(side="right")
+        tk.Label(self.si_key_frame,
+                 text="from the SayIntentions pilot portal (needs a subscription)",
+                 bg=BG, fg=FAINT, font=self.font_small, anchor="w").pack(
+                     fill="x", pady=(self.px(5), 0))
+
+        tk.Frame(page, bg=LINE, height=1).pack(fill="x", pady=(self.px(13), self.px(10)))
+
+        # Freeze the active ATC add-on's process alongside the sim (was on the
+        # main panel; it is a setting).
+        self.freeze_var = tk.BooleanVar(value=self.pause_atc)
+        tk.Checkbutton(page, text="Also freeze the ATC app when paused",
+                       variable=self.freeze_var, command=self.on_toggle_freeze,
+                       font=self.font_small, bg=BG, fg=MUTED, activebackground=BG,
+                       activeforeground=INK, selectcolor=CARD_BG, anchor="w",
+                       bd=0, highlightthickness=0, padx=0, pady=0).pack(fill="x")
+        self._refresh_provider_ui()
+
+        # RegisterHotKey is system-wide, so this remains useful with MSFS in
+        # front.  The entry captures a real key press instead of asking users to
+        # spell a platform-specific shortcut syntax.
+        tk.Frame(page, bg=LINE, height=1).pack(fill="x", pady=(self.px(13), self.px(10)))
+        tk.Label(page, text="GLOBAL PAUSE HOTKEY", bg=BG, fg=MUTED, font=self.font_small,
+                 anchor="w").pack(fill="x")
+        tk.Label(page, text="click the field, then press a key combination",
+                 bg=BG, fg=FAINT, font=self.font_small, anchor="w").pack(
+                     fill="x", pady=(self.px(2), 0))
+        hrow = tk.Frame(page, bg=BG)
+        hrow.pack(fill="x", pady=(self.px(8), 0))
+        tk.Label(hrow, text="PAUSE KEY", bg=BG, fg=FAINT, font=self.font_small,
+                 width=9, anchor="w").pack(side="left")
+        self.hotkey_var = tk.StringVar(value=self.pause_hotkey)
+        self.hotkey_entry = tk.Entry(hrow, textvariable=self.hotkey_var, font=self.font_body,
+                                     bg=CARD_BG, fg=INK, relief="solid", borderwidth=1,
+                                     highlightthickness=0, insertbackground=INK)
+        self.hotkey_entry.pack(side="left", fill="x", expand=True,
+                               padx=(self.px(6), self.px(6)), ipady=self.px(3))
+        self.hotkey_entry.bind("<FocusIn>", self._on_hotkey_focus)
+        self.hotkey_entry.bind("<FocusOut>", lambda _e: self._save_hotkey())
+        self.hotkey_entry.bind("<KeyPress>", self._capture_hotkey)
+        tk.Button(hrow, text="CLEAR", command=self.on_clear_hotkey,
+                  font=self.font_small, bg=BTN_BG, fg=INK, activebackground="#e6e3dd",
+                  relief="solid", borderwidth=1, highlightthickness=0,
+                  padx=self.px(10), pady=self.px(3)).pack(side="right")
+        initial_hotkey_status = (self.hotkey_config_error or
+                                 ("global pause hotkey is off" if not self.pause_hotkey
+                                  else "starting global hotkey…"))
+        self.hotkey_status = tk.Label(page, text=initial_hotkey_status, bg=BG, fg=FAINT,
+                                      font=self.font_small, anchor="w")
+        self.hotkey_status.pack(fill="x", pady=(self.px(4), 0))
+
+        # Telegram alerts.  Both fields save on focus-out, so they are typed once
+        # and remembered like the SimBrief ID.
+        tk.Frame(page, bg=LINE, height=1).pack(fill="x", pady=(self.px(13), self.px(10)))
+        tk.Label(page, text="TELEGRAM ALERTS", bg=BG, fg=MUTED, font=self.font_small,
+                 anchor="w").pack(fill="x")
+        tk.Label(page, text="a buzz on your phone the moment the sim pauses",
+                 bg=BG, fg=FAINT, font=self.font_small, anchor="w").pack(
+                     fill="x", pady=(self.px(2), 0))
+
+        trow = tk.Frame(page, bg=BG)
+        trow.pack(fill="x", pady=(self.px(9), 0))
+        tk.Label(trow, text="BOT TOKEN", bg=BG, fg=FAINT, font=self.font_small,
+                 width=9, anchor="w").pack(side="left")
+        self.tg_token_var = tk.StringVar(value=str(self.cfg.get("telegram_bot_token") or ""))
+        e_token = tk.Entry(trow, textvariable=self.tg_token_var, font=self.font_body,
+                           bg=CARD_BG, fg=INK, relief="solid", borderwidth=1,
+                           highlightthickness=0, insertbackground=INK)
+        e_token.pack(side="left", fill="x", expand=True, padx=(self.px(6), 0), ipady=self.px(3))
+        e_token.bind("<FocusOut>", lambda _e: self._save_telegram())
+        e_token.bind("<Return>", lambda _e: self._save_telegram())
+
+        crow = tk.Frame(page, bg=BG)
+        crow.pack(fill="x", pady=(self.px(7), 0))
+        tk.Label(crow, text="CHAT ID", bg=BG, fg=FAINT, font=self.font_small,
+                 width=9, anchor="w").pack(side="left")
+        self.tg_chat_var = tk.StringVar(value=str(self.cfg.get("telegram_chat_id") or ""))
+        e_chat = tk.Entry(crow, textvariable=self.tg_chat_var, font=self.font_body,
+                          bg=CARD_BG, fg=INK, relief="solid", borderwidth=1,
+                          highlightthickness=0, insertbackground=INK)
+        e_chat.pack(side="left", fill="x", expand=True, padx=(self.px(6), 0), ipady=self.px(3))
+        e_chat.bind("<FocusOut>", lambda _e: self._save_telegram())
+        e_chat.bind("<Return>", lambda _e: self._save_telegram())
+
+        brow = tk.Frame(page, bg=BG)
+        brow.pack(fill="x", pady=(self.px(9), 0))
+        self.tg_status = tk.Label(brow, text="", bg=BG, fg=FAINT, font=self.font_small,
+                                  anchor="w", wraplength=self.px(210), justify="left")
+        self.tg_status.pack(side="left", fill="x", expand=True)
+        self.btn_test = tk.Button(brow, text="SEND TEST", command=self.on_test_telegram,
+                                  font=self.font_small, bg=BTN_BG, fg=INK,
+                                  activebackground="#e6e3dd", relief="solid", borderwidth=1,
+                                  highlightthickness=0, padx=self.px(10), pady=self.px(3))
+        self.btn_test.pack(side="right")
+
+        tk.Label(page, text="token from @BotFather · chat ID from @userinfobot",
+                 bg=BG, fg=FAINT, font=self.font_small, anchor="w").pack(
+                     fill="x", pady=(self.px(7), 0))
+
+    def _show_page(self, settings: bool) -> None:
+        """Swap the outer area between the operating panel and settings."""
+        self._settings_open = settings
+        if settings:
+            self.main_page.pack_forget()
+            self.settings_page.pack(fill="both", expand=True)
+            self.btn_settings.configure(text="×")
+        else:
+            self._save_telegram()       # persist any un-blurred field edits
+            self.settings_page.pack_forget()
+            self.main_page.pack(fill="both", expand=True)
+            self.btn_settings.configure(text="⚙")
+
     def _button(self, parent, text: str, command, last: bool,
                 primary: bool = False) -> tk.Button:
         if primary:
@@ -1146,33 +1788,213 @@ class App:
     def run(self) -> None:
         self.watcher.start()
         self.sim.start()
+        self.hotkey.start()
         self.root.after(200, self._tick)
         self.root.mainloop()
 
     def quit(self) -> None:
+        self._save_telegram()           # persist any un-blurred field edits
         self.watcher.stop()
         self.sim.stop()
-        self.batc.resume()              # never leave BeyondATC frozen on exit
+        self.hotkey.stop()
+        self.atc.resume()              # never leave BeyondATC frozen on exit
         self.root.destroy()
 
     def _pause(self) -> None:
         self.sim.pause()
-        if self.pause_batc:
-            self.batc.suspend()
+        if self.pause_atc:
+            self.atc.suspend()
 
     def _resume(self) -> None:
         self.sim.resume()
-        self.batc.resume()              # harmless if it was never suspended
+        self.atc.resume()              # harmless if it was never suspended
 
-    def on_toggle_batc(self) -> None:
-        self.pause_batc = self.batc_var.get()
-        save_config(pause_beyondatc=self.pause_batc)
-        if self.pause_batc and self.status.sim_paused:
-            self.batc.suspend()         # enabled mid-pause: freeze it now
-        elif not self.pause_batc:
-            self.batc.resume()          # disabled: thaw it right away
+    def on_toggle_freeze(self) -> None:
+        self.pause_atc = self.freeze_var.get()
+        save_config(pause_beyondatc=self.pause_atc)
+        if self.pause_atc and self.status.sim_paused:
+            self.atc.suspend()         # enabled mid-pause: freeze it now
+        elif not self.pause_atc:
+            self.atc.resume()          # disabled: thaw it right away
+
+    def _on_hotkey_focus(self, _event) -> None:
+        self.hotkey_status.configure(text="press a shortcut, or Esc to keep the current one")
+
+    def _capture_hotkey(self, event) -> str:
+        # Modifier-down events are incomplete combinations; wait for the key.
+        if event.keysym in {"Control_L", "Control_R", "Alt_L", "Alt_R",
+                            "Shift_L", "Shift_R", "Win_L", "Win_R"}:
+            return "break"
+        if event.keysym == "Escape":
+            self.hotkey_entry.selection_clear()
+            self.root.focus_set()
+            self.hotkey_status.configure(
+                text="global pause hotkey is off" if not self.pause_hotkey
+                else f"global: {self.pause_hotkey}")
+            return "break"
+        names: list[str] = []
+        if event.state & 0x0004:
+            names.append("CTRL")
+        # On Windows Tk uses 0x0008 for Num Lock (not Alt); Alt is bit 17.
+        # Checking Mod1 here made every shortcut look like Alt on keyboards
+        # with Num Lock enabled.
+        if event.state & 0x20000:
+            names.append("ALT")
+        if event.state & 0x0001:
+            names.append("SHIFT")
+        key = event.keysym.upper()
+        # Tk spells these a little differently than the Windows key names.
+        key = {"RETURN": "ENTER", "ESCAPE": "ESC", "PRIOR": "PAGEUP",
+               "NEXT": "PAGEDOWN", "SPACE": "SPACE"}.get(key, key)
+        try:
+            display, _, _ = parse_hotkey("+".join([*names, key]))
+        except ValueError as exc:
+            self.hotkey_status.configure(text=str(exc))
+            return "break"
+        self.hotkey_var.set(display)
+        self._save_hotkey()
+        self.root.focus_set()
+        return "break"
+
+    def _save_hotkey(self) -> None:
+        value = self.hotkey_var.get().strip()
+        if not value:
+            display = ""
+        else:
+            try:
+                display, _, _ = parse_hotkey(value)
+            except ValueError as exc:
+                self.hotkey_status.configure(text=str(exc))
+                return
+        if display == self.pause_hotkey:
+            return
+        self.pause_hotkey = display
+        self.hotkey_var.set(display)
+        self.cfg["pause_hotkey"] = display
+        save_config(pause_hotkey=display)
+        self.hotkey_status.configure(
+            text="global pause hotkey is off" if not display else "registering global hotkey…")
+        self.hotkey.configure(display)
+
+    def on_clear_hotkey(self) -> None:
+        self.hotkey_var.set("")
+        self._save_hotkey()
+
+    # -- ATC provider -------------------------------------------------------
+
+    def on_provider_change(self, provider: str) -> None:
+        provider = provider.lower()
+        if provider == self.provider:
+            return
+        self.provider = provider
+        self.cfg["provider"] = provider
+        save_config(provider=provider)
+
+        # Swap the clearance watcher (threads cannot restart, so build a fresh one).
+        self.watcher.stop()
+        self.watcher = make_watcher(self.cfg, self.status, self.events)
+        self.watcher.start()
+
+        # Re-point the freeze controller at the new provider's process.
+        was_suspended = self.atc.suspended
+        self.atc.resume()
+        self.atc = AtcProcessController(active_atc_process(self.cfg))
+        if was_suspended and self.pause_atc and self.status.sim_paused:
+            self.atc.suspend()
+
+        self.status.log_ok = False
+        self.status.log_detail = "switching…"
+        self._refresh_provider_ui()
+
+    def _refresh_provider_ui(self) -> None:
+        for key, btn in self.provider_btns.items():
+            on = (key == self.provider)
+            btn.configure(bg=SPEED_ON_BG if on else CARD_BG,
+                          fg=SPEED_ON_FG if on else MUTED,
+                          activebackground=SPEED_ON_BG if on else "#efece6")
+        if self.provider == "sayintentions":
+            self.si_key_frame.pack(fill="x")
+        else:
+            self.si_key_frame.pack_forget()
+        self.row_log_name.configure(text=provider_row_label(self.cfg))
+
+    def _save_si_key(self) -> None:
+        key = self.si_key_var.get().strip()
+        if key == str(self.cfg.get("sayintentions_api_key") or ""):
+            return
+        self.cfg["sayintentions_api_key"] = key
+        save_config(sayintentions_api_key=key)
+        if isinstance(self.watcher, SayIntentionsWatcher):
+            self.watcher.update_key(key)
+
+    def on_test_si(self) -> None:
+        self._save_si_key()
+        key = self.si_key_var.get().strip()
+        if not key:
+            self.si_status.configure(text="enter your API key first")
+            return
+        self.btn_si_test.configure(text="…", state="disabled")
+        self.si_status.configure(text="checking…")
+        threading.Thread(target=self._si_test_worker, args=(key,),
+                         name="SiTest", daemon=True).start()
+
+    def _si_test_worker(self, key: str) -> None:
+        ok, msg = si_check_key(key)
+        self.si_results.put((ok, msg))
+
+    def _save_telegram(self) -> None:
+        token = self.tg_token_var.get().strip()
+        chat = self.tg_chat_var.get().strip()
+        if token == self.notifier.token and chat == self.notifier.chat_id:
+            return                      # nothing changed, skip the disk write
+        self.notifier.update(token, chat)
+        self.cfg["telegram_bot_token"] = token
+        self.cfg["telegram_chat_id"] = chat
+        save_config(telegram_bot_token=token, telegram_chat_id=chat)
+
+    def on_test_telegram(self) -> None:
+        self._save_telegram()
+        if not self.notifier.configured:
+            self.tg_status.configure(text="enter a bot token and chat ID first")
+            return
+        self.btn_test.configure(text="…", state="disabled")
+        self.tg_status.configure(text="sending test message…")
+        threading.Thread(target=self._test_worker, name="TgTest", daemon=True).start()
+
+    def _test_worker(self) -> None:
+        ok, msg = self.notifier.send_sync(
+            f"{APP_NAME}: test alert - notifications are working.")
+        self.telegram_results.put((ok, msg))
+
+    def _check_notify(self) -> None:
+        """Send a resume alert on the paused->running edge, but only when we
+        announced the pause that preceded it, so it can never fire on its own."""
+        paused = self.status.sim_paused
+        was, self._was_paused = self._was_paused, paused
+        if was and not paused and self._pause_notified:
+            self._pause_notified = False
+            if self.cfg.get("notify_on_resume", True):
+                self.notifier.notify(f"▶ {APP_NAME}: MSFS 2024 resumed")
+
+    def _pause_message(self, trigger: Trigger) -> str:
+        when = time.strftime("%H:%MZ", time.gmtime())
+        detail = (trigger.text or "").strip()
+        head = f"⏸ {APP_NAME}: paused MSFS 2024"
+        mid = trigger.label + (f" · {detail}" if detail else "")
+        return f"{head}\n{mid}\n{when}"
 
     def _tick(self) -> None:
+        while True:
+            try:
+                kind, detail = self.hotkey.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "pressed":
+                # Keep the global shortcut's semantics identical to the visible
+                # Pause Sim / Resume Sim control.
+                self.on_pause_toggle()
+            else:
+                self.hotkey_status.configure(text=detail)
         while True:
             try:
                 trigger = self.events.get_nowait()
@@ -1185,7 +2007,23 @@ class App:
             except queue.Empty:
                 break
             self._on_plan_result(*result)
+        while True:
+            try:
+                ok, msg = self.telegram_results.get_nowait()
+            except queue.Empty:
+                break
+            self.btn_test.configure(text="SEND TEST", state="normal")
+            self.tg_status.configure(
+                text="test sent - check Telegram" if ok else f"failed: {msg}")
+        while True:
+            try:
+                ok, msg = self.si_results.get_nowait()
+            except queue.Empty:
+                break
+            self.btn_si_test.configure(text="TEST", state="normal")
+            self.si_status.configure(text=msg)
         self._check_rearm()
+        self._check_notify()
         self._eval_waypoint()
         self._refresh()
         self.root.after(200, self._tick)
@@ -1204,6 +2042,9 @@ class App:
             self.speed_target = 1.0
             self.sim.set_rate(1.0)
         self._pause()
+        if self.cfg.get("notify_on_pause", True):
+            self.notifier.notify(self._pause_message(trigger))
+            self._pause_notified = self.notifier.configured
         now = time.monotonic()
         if self.rearm_mode == "manual":
             self.armed = False
